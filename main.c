@@ -1,20 +1,3 @@
-/**
-  ******************************************************************************
-  * @file    Wifi/WiFi_Client_Server/src/main.c
-  * @author  MCD Application Team
-  * @brief   This file provides main program functions
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2017 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -52,8 +35,7 @@ uint8_t RemoteIP[] = {172,20,10,3};
 #if defined (TERMINAL_USE)
 extern UART_HandleTypeDef hDiscoUart;
 #endif /* TERMINAL_USE */
-static uint8_t RxData [500];
-
+int32_t Socket = -1;
 
 /* Private function prototypes -----------------------------------------------*/
 #if defined (TERMINAL_USE)
@@ -67,9 +49,6 @@ static uint8_t RxData [500];
 #endif /* TERMINAL_USE */
 
 static void SystemClock_Config(void);
-
-
-
 extern  SPI_HandleTypeDef hspi;
 
 /* Private functions ---------------------------------------------------------*/
@@ -114,7 +93,6 @@ uint16_t TTP229_ReadKeys(void)
     return data;
 }
 
-
 /**
   * @brief  Main program
   * @param  None
@@ -125,7 +103,7 @@ int main(void)
   uint8_t  MAC_Addr[6] = {0};
   uint8_t  IP_Addr[4] = {0};
   uint8_t TxData[] = "STM32 : Hello!\n";
-  int32_t Socket = -1;
+
   uint16_t Datalen;
   int32_t ret;
   int16_t Trials = CONNECTION_TRIAL_MAX;
@@ -142,12 +120,17 @@ int main(void)
   // 启用 GPIOA（用于 PA0、PA1）
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  // 初始化 PA0 和 PA1 为输入
+
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin = BUTTON1_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;  // 如果按键电路为上拉输出，也可改为 GPIO_PULLUP
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING; // 支持按下（下降）和松开（上升）中断
+  GPIO_InitStruct.Pull = GPIO_PULLUP;  // 按键接 GND 时用上拉
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  // 启用 EXTI 中断通道 0（PA0 对应 EXTI0）
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
 
 #if defined (TERMINAL_USE)
   /* Initialize all configured peripherals */
@@ -245,48 +228,27 @@ int main(void)
     BSP_LED_On(LED2);
   }
   TTP229_GPIO_Init();
-
   while (1)
-  {
-      uint16_t keys = TTP229_ReadKeys();
-      GPIO_PinState key1 = HAL_GPIO_ReadPin(BUTTON1_GPIO_PORT, BUTTON1_PIN);
+    {
+        uint16_t keys = TTP229_ReadKeys();
 
-      // 控制 LED
-      if (key1 == GPIO_PIN_RESET)
-      {
-          BSP_LED_On(LED2);
-      }
-      else
-      {
-          BSP_LED_Off(LED2);
-      }
+        // 打印调试信息
+        if (keys != 0)
+        {
+            TERMOUT("Keys Pressed: 0d%08X\n", keys);
+            // 构造发送内容
+            uint8_t tx_buf[2];
+            tx_buf[0] = (keys >> 8) & 0xFF;
+            tx_buf[1] = keys & 0xFF;
 
-      // 打印调试信息
-      if (keys != 0)
-      {
-          TERMOUT("Keys Pressed: 0d%08X\n", keys);
-      }
-
-      // 构造发送内容
-      uint8_t tx_buf[2];
-      tx_buf[0] = (keys >> 8) & 0xFF;
-      tx_buf[1] = keys & 0xFF;
-
-      // 如果按钮按下，将最高位（bit7）置 1
-      if (key1 == GPIO_PIN_RESET)
-      {
-          tx_buf[0] |= 0x80;
-      }
-
-      uint16_t sentLen = 0;
-      if (WIFI_SendData(Socket, tx_buf, sizeof(tx_buf), &sentLen, WIFI_WRITE_TIMEOUT) != WIFI_STATUS_OK)
-      {
-          TERMOUT("> ERROR: Failed to send data via WiFi\n");
-      }
-
-      HAL_Delay(50); // 防抖
-  }
-
+            uint16_t sentLen = 0;
+            if (WIFI_SendData(Socket, tx_buf, sizeof(tx_buf), &sentLen, WIFI_WRITE_TIMEOUT) != WIFI_STATUS_OK)
+            {
+                TERMOUT("> ERROR: Failed to send data via WiFi\n");
+            }
+        }
+        HAL_Delay(50); // 防抖
+    }
 }
 
 /**
@@ -391,6 +353,33 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   switch (GPIO_Pin)
   {
+  	  case GPIO_PIN_0:
+      {
+        GPIO_PinState key_state = HAL_GPIO_ReadPin(BUTTON1_GPIO_PORT, BUTTON1_PIN);
+
+        // 控制 LED2
+        if (key_state == GPIO_PIN_RESET)
+        {
+            BSP_LED_On(LED2);  // 按下，点亮
+        }
+        else
+        {
+            BSP_LED_Off(LED2); // 松开，熄灭
+        }
+
+        // 构造并发送数据（若需要）
+        uint8_t tx_buf[2];
+        tx_buf[0] = 0xAA;  // 自定义标识符：PA0 按键事件
+        tx_buf[1] = (key_state == GPIO_PIN_RESET) ? 0x01 : 0x00;
+
+        uint16_t sentLen;
+        if (Socket >= 0)
+        {
+            WIFI_SendData(Socket, tx_buf, sizeof(tx_buf), &sentLen, WIFI_WRITE_TIMEOUT);
+        }
+
+        break;
+      }
     case (GPIO_PIN_1):
     {
       SPI_WIFI_ISR();
@@ -401,6 +390,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       break;
     }
   }
+}
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);  // 必须有这句，派发给 HAL
 }
 
 void SPI3_IRQHandler(void)
